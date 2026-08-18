@@ -1,5 +1,9 @@
 """Tests for Module 1: Advanced Chunking."""
+import io
 import sys, os
+from contextlib import redirect_stdout
+
+from pypdf import PdfWriter
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.m1_chunking import (chunk_basic, chunk_semantic, chunk_hierarchical,
                               chunk_structure_aware, compare_strategies, load_documents, Chunk)
@@ -70,6 +74,13 @@ def test_hierarchical_children_smaller():
     avg_c = sum(len(c.text) for c in children) / max(len(children), 1)
     assert avg_c < avg_p, "Children should be smaller than parents"
 
+def test_hierarchical_parent_ids_are_unique_between_documents():
+    parents_a, _ = chunk_hierarchical(TEXT, metadata={"source": "a.md"})
+    parents_b, _ = chunk_hierarchical(TEXT, metadata={"source": "b.md"})
+    ids_a = {p.metadata["parent_id"] for p in parents_a}
+    ids_b = {p.metadata["parent_id"] for p in parents_b}
+    assert ids_a.isdisjoint(ids_b), "Parent IDs must not collide between documents"
+
 
 # --- Structure-Aware Chunking ---
 
@@ -86,6 +97,17 @@ def test_structure_has_section_metadata():
     result = chunk_structure_aware(TEXT)
     if result:
         assert any("section" in c.metadata for c in result), "Should have section in metadata"
+
+
+def test_load_documents_warning_supports_windows_console(tmp_path):
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with open(tmp_path / "scan.pdf", "wb") as pdf_file:
+        writer.write(pdf_file)
+
+    output = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    with redirect_stdout(output):
+        assert load_documents(str(tmp_path)) == []
 
 
 # --- Compare ---
