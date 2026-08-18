@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Module 3: Reranking — Cross-encoder top-20 → top-3 + latency benchmark."""
 
-import os, sys, time
+import os, sys, time, re
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,6 +19,7 @@ class RerankResult:
 
 
 _MODEL_CACHE: dict[str, object] = {}
+_MODEL_LOAD_FAILURES: set[str] = set()
 
 
 def _get_cross_encoder(model_name: str):
@@ -43,8 +44,28 @@ class CrossEncoderReranker:
 
     def _load_model(self):
         if self._model is None:
+            if self.model_name in _MODEL_LOAD_FAILURES:
+                raise RuntimeError("model load previously failed in this process")
             self._model = _get_cross_encoder(self.model_name)
         return self._model
+
+    @staticmethod
+    def _fallback_rerank(query: str, documents: list[dict], top_k: int) -> list[RerankResult]:
+        """Low-memory lexical fallback used only when CrossEncoder is unavailable."""
+        query_tokens = set(re.findall(r"\w+", query.lower(), flags=re.UNICODE))
+        scored = []
+        for doc in documents:
+            doc_tokens = set(re.findall(r"\w+", doc["text"].lower(), flags=re.UNICODE))
+            overlap = len(query_tokens & doc_tokens) / max(len(query_tokens), 1)
+            scored.append((overlap, float(doc.get("score", 0.0)), doc))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [
+            RerankResult(
+                text=doc["text"], original_score=original_score,
+                rerank_score=overlap, metadata=doc.get("metadata", {}), rank=i,
+            )
+            for i, (overlap, original_score, doc) in enumerate(scored[:max(top_k, 0)])
+        ]
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k.
@@ -59,11 +80,16 @@ class CrossEncoderReranker:
         try:
             model = self._load_model()
         except Exception as e:
+            _MODEL_LOAD_FAILURES.add(self.model_name)
             print(f"[WARNING] Reranker '{self.model_name}' load failed: {type(e).__name__}: {e}")
-            return []
+            return self._fallback_rerank(query, documents, top_k)
 
         pairs = [(query, doc["text"]) for doc in documents]
-        scores = model.predict(pairs, show_progress_bar=False)
+        try:
+            scores = model.predict(pairs, show_progress_bar=False)
+        except Exception as e:
+            print(f"[WARNING] Reranker inference failed: {type(e).__name__}: {e}")
+            return self._fallback_rerank(query, documents, top_k)
         if not hasattr(scores, "__len__"):                  # 1 pair có thể trả scalar
             scores = [scores]
 

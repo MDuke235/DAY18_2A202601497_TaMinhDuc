@@ -7,8 +7,15 @@ Chạy: python check_lab.py
 
 import json
 import os
+import re
 import sys
 import subprocess
+
+
+def _configure_console() -> None:
+    """Use UTF-8 for Vietnamese/emoji output on Windows CP1252 consoles."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def check_file(path: str, required: bool = True) -> bool:
@@ -55,20 +62,16 @@ def run_tests() -> tuple[int, int]:
     """Run pytest and return (passed, total)."""
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=no", "-q"],
-            capture_output=True, text=True, timeout=120,
+            [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=no", "-q",
+             "--basetemp", os.path.join(".pytest_cache", "check_lab")],
+            capture_output=True, text=True, timeout=600,
         )
-        lines = result.stdout.strip().split("\n")
-        summary = lines[-1] if lines else ""
-        # Parse "X passed, Y failed" or "X passed"
-        passed = total = 0
-        for part in summary.split(","):
-            part = part.strip()
-            if "passed" in part:
-                passed = int(part.split()[0])
-                total += passed
-            if "failed" in part:
-                total += int(part.split()[0])
+        # Pytest may decorate the summary with "====", so parse counts by label.
+        passed_matches = re.findall(r"(\d+)\s+passed", result.stdout)
+        failed_matches = re.findall(r"(\d+)\s+failed", result.stdout)
+        passed = int(passed_matches[-1]) if passed_matches else 0
+        failed = int(failed_matches[-1]) if failed_matches else 0
+        total = passed + failed
         return passed, total
     except Exception as e:
         print(f"  ⚠️  pytest error: {e}")
@@ -76,6 +79,7 @@ def run_tests() -> tuple[int, int]:
 
 
 def validate():
+    _configure_console()
     print("🔍 Kiểm tra bài nộp Lab 18: Production RAG\n")
     errors = 0
 

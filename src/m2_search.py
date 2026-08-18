@@ -182,11 +182,18 @@ class HybridSearch:
 
     def index(self, chunks: list[dict]) -> None:
         self.bm25.index(chunks)
-        self.dense.index(chunks)
+        try:
+            self.dense.index(chunks)
+        except Exception as e:
+            print(f"[WARNING] Dense index unavailable; BM25 remains active: {type(e).__name__}: {e}")
 
     def search(self, query: str, top_k: int = HYBRID_TOP_K) -> list[SearchResult]:
         bm25_results = self.bm25.search(query, top_k=BM25_TOP_K)
-        dense_results = self.dense.search(query, top_k=DENSE_TOP_K)
+        try:
+            dense_results = self.dense.search(query, top_k=DENSE_TOP_K)
+        except Exception as e:
+            print(f"[WARNING] Dense search unavailable: {type(e).__name__}: {e}")
+            dense_results = []
         return reciprocal_rank_fusion([bm25_results, dense_results], top_k=top_k)
 
 

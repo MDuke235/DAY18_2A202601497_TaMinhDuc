@@ -2,14 +2,15 @@ from __future__ import annotations
 
 """Production RAG Pipeline — Bài tập NHÓM: ghép M1+M2+M3+M4."""
 
-import os, sys, time
+import os, sys, time, json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.m1_chunking import load_documents, chunk_hierarchical
 from src.m2_search import HybridSearch
 from src.m3_rerank import CrossEncoderReranker
-from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_report
+from src.m4_eval import (load_test_set, evaluate_ragas, failure_analysis, save_report,
+                         REPORTS_DIR)
 from src.m5_enrichment import enrich_chunks
 from config import RERANK_TOP_K
 
@@ -57,30 +58,94 @@ def build_pipeline():
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
-    """Run single query through pipeline."""
+# System prompt của bước generation.
+#
+# Bản đầu ("Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'") làm
+# gpt-4o-mini từ chối trả lời 4/20 câu dù context top-1 chứa đúng câu trả lời
+# (faithfulness = 0.0, answer_relevancy = 0.0 — xem analysis/failure_analysis.md).
+# Nguyên nhân: chunk sau enrichment mở đầu bằng 1 câu meta ("Đoạn văn nằm trong...")
+# và có thể bắt đầu giữa câu của section trước, nên model coi context là "không đủ".
+# Prompt dưới đây nói rõ 3 điều: context là các đoạn rời rạc, một đoạn khớp là đủ,
+# và khi có nhiều phiên bản thì ưu tiên phiên bản mới nhất (data có mat_khau v1/v2).
+ANSWER_SYSTEM_PROMPT = (
+    "Bạn là trợ lý tra cứu quy định nội bộ. Trả lời CHỈ dựa trên context được cung cấp.\n"
+    "- Trả lời trực tiếp, đầy đủ câu hỏi, kèm con số/tên chức danh cụ thể nếu context có.\n"
+    "- Context là các đoạn rời rạc, có thể lẫn tiêu đề mục hoặc câu không liên quan: "
+    "chỉ cần MỘT đoạn chứa thông tin là đã đủ để trả lời.\n"
+    "- Nếu context có nhiều phiên bản khác nhau, ưu tiên phiên bản mới nhất và nói rõ phiên bản.\n"
+    "- Chỉ trả lời 'Không tìm thấy.' khi thực sự không có đoạn nào liên quan."
+)
+
+
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker,
+              timings: dict | None = None) -> tuple[str, list[str]]:
+    """Run single query through pipeline.
+
+    timings (optional): dict để ghi latency từng stage (retrieve/rerank/generate)
+    cho latency breakdown report.
+    """
+    t0 = time.time()
     results = search.search(query)
+    t_retrieve = time.time() - t0
+
+    t0 = time.time()
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
     contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    t_rerank = time.time() - t0
 
+    t0 = time.time()
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
         try:
             from openai import OpenAI
             client = OpenAI()
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+            resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=[
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
             ])
             answer = resp.choices[0].message.content
         except Exception as e:
-            print(f"  ⚠️  LLM generation failed: {e}", flush=True)
+            print(f"[WARNING] LLM generation failed: {e}", flush=True)
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+    t_generate = time.time() - t0
+
+    if timings is not None:
+        timings.setdefault("retrieve_ms", []).append(t_retrieve * 1000)
+        timings.setdefault("rerank_ms", []).append(t_rerank * 1000)
+        timings.setdefault("generate_ms", []).append(t_generate * 1000)
+        timings.setdefault("total_ms", []).append((t_retrieve + t_rerank + t_generate) * 1000)
+
     return answer, contexts
+
+
+def save_latency_report(timings: dict, path: str = "latency_report.json"):
+    """Ghi latency breakdown per-stage ra reports/ (avg / p50 / p95 / max)."""
+    def stats(values: list[float]) -> dict:
+        s = sorted(values)
+        n = len(s)
+        pick = lambda q: s[min(n - 1, int(q * n))]
+        return {"n": n, "avg_ms": round(sum(s) / n, 1), "p50_ms": round(pick(0.5), 1),
+                "p95_ms": round(pick(0.95), 1), "max_ms": round(s[-1], 1)}
+
+    report = {stage: stats(values) for stage, values in timings.items() if values}
+    out = os.path.join(REPORTS_DIR, path)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print("\n" + "=" * 60)
+    print("LATENCY BREAKDOWN (per query)")
+    print("=" * 60)
+    print(f"  {'stage':<12} {'avg':>9} {'p50':>9} {'p95':>9} {'max':>9}")
+    for stage, s in report.items():
+        print(f"  {stage:<12} {s['avg_ms']:>8.1f}ms {s['p50_ms']:>8.1f}ms "
+              f"{s['p95_ms']:>8.1f}ms {s['max_ms']:>8.1f}ms")
+    print(f"Latency report saved to {out}")
+    return report
 
 
 def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
@@ -88,9 +153,10 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     test_set = load_test_set()
     print(f"\n[Eval] Running {len(test_set)} queries...", flush=True)
     questions, answers, all_contexts, ground_truths = [], [], [], []
+    timings: dict[str, list[float]] = {}
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+        answer, contexts = run_query(item["question"], search, reranker, timings=timings)
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
@@ -111,6 +177,7 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
 
     failures = failure_analysis(results.get("per_question", []))
     save_report(results, failures)
+    save_latency_report(timings)
     return results
 
 

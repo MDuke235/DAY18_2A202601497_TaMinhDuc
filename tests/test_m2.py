@@ -1,7 +1,10 @@
 """Tests for Module 2: Hybrid Search."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.m2_search import segment_vietnamese, BM25Search, reciprocal_rank_fusion, SearchResult
+from src.m2_search import (
+    segment_vietnamese, BM25Search, HybridSearch,
+    reciprocal_rank_fusion, SearchResult,
+)
 
 CHUNKS = [
     {"text": "Nhân viên được nghỉ phép năm 12 ngày.", "metadata": {"source": "policy"}},
@@ -37,3 +40,30 @@ def test_rrf_method():
     merged = reciprocal_rank_fusion([a, b], top_k=1)
     if merged:
         assert merged[0].method == "hybrid"
+
+
+def test_hybrid_search_falls_back_to_bm25_when_dense_is_unavailable():
+    search = HybridSearch()
+    search.bm25.index(CHUNKS)
+    search.dense.search = lambda *args, **kwargs: (_ for _ in ()).throw(
+        ConnectionError("Qdrant unavailable")
+    )
+
+    results = search.search("nghỉ phép", top_k=2)
+
+    assert results
+    assert results[0].method == "hybrid"
+    assert results[0].metadata["rrf_methods"] == ["bm25"]
+
+
+def test_hybrid_index_keeps_bm25_when_dense_index_is_unavailable():
+    search = HybridSearch()
+    search.dense.index = lambda *args, **kwargs: (_ for _ in ()).throw(
+        ConnectionError("Qdrant unavailable")
+    )
+
+    search.index(CHUNKS)
+    results = search.bm25.search("nghỉ phép", top_k=2)
+
+    assert results
+    assert results[0].method == "bm25"

@@ -6,4 +6,5 @@ __pycache__/
 qdrant_data/
 *.egg-info/
 reports/*.json
+!reports/latency_report.json
 .venv/
